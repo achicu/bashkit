@@ -432,6 +432,10 @@ pub struct Interpreter {
     jobs: SharedJobTable,
     /// Current line number for $LINENO
     current_line: usize,
+    /// Pausable execution clock for timeout enforcement.
+    /// When set, the clock is checked at command boundaries instead of
+    /// relying solely on the outer tokio::time::timeout.
+    execution_clock: Option<crate::clock::ExecutionClock>,
     /// HTTP client for network builtins (curl, wget)
     #[cfg(feature = "http_client")]
     http_client: Option<crate::network::HttpClient>,
@@ -764,6 +768,7 @@ impl Interpreter {
             counters: ExecutionCounters::new(),
             jobs: jobs::new_shared_job_table(),
             current_line: 1,
+            execution_clock: None,
             #[cfg(feature = "http_client")]
             http_client: None,
             #[cfg(feature = "git")]
@@ -1043,11 +1048,31 @@ impl Interpreter {
         true
     }
 
+    /// Set the execution clock for pausable timeout enforcement.
+    ///
+    /// When set, the clock is checked at command boundaries and
+    /// propagated to the HTTP client so permission callbacks can
+    /// pause it.
+    pub fn set_execution_clock(&mut self, clock: crate::clock::ExecutionClock) {
+        #[cfg(feature = "http_client")]
+        if let Some(ref mut client) = self.http_client {
+            client.set_execution_clock(clock.clone());
+        }
+        self.execution_clock = Some(clock);
+    }
+
     /// Set the HTTP client for network builtins (curl, wget).
     ///
     /// This is only available when the `http_client` feature is enabled.
     #[cfg(feature = "http_client")]
     pub fn set_http_client(&mut self, client: crate::network::HttpClient) {
+        // Propagate execution clock to the new client
+        if let Some(ref clock) = self.execution_clock {
+            let mut client = client;
+            client.set_execution_clock(clock.clone());
+            self.http_client = Some(client);
+            return;
+        }
         self.http_client = Some(client);
     }
 
@@ -1273,6 +1298,16 @@ impl Interpreter {
             self.counters
                 .check_session_limits(&self.session_limits)
                 .map_err(|e| crate::error::Error::Execution(e.to_string()))?;
+            // Check execution clock (pausable timeout) at command boundary.
+            // This supplements the outer tokio::time::timeout with a clock that
+            // excludes time spent in permission callbacks and other external waits.
+            if let Some(ref clock) = self.execution_clock
+                && clock.is_expired(self.limits.timeout)
+            {
+                return Err(crate::error::Error::ResourceLimit(
+                    crate::limits::LimitExceeded::Timeout(self.limits.timeout),
+                ));
+            }
 
             match command {
                 Command::Simple(simple) => self.execute_simple_command(simple, None).await,

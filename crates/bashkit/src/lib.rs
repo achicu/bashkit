@@ -397,6 +397,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 mod builtins;
+pub mod clock;
 mod error;
 mod fs;
 mod git;
@@ -418,6 +419,7 @@ pub mod trace;
 
 pub use async_trait::async_trait;
 pub use builtins::{Builtin, Context as BuiltinContext};
+pub use clock::{ExecutionClock, PauseGuard};
 pub use error::{Error, Result};
 pub use fs::{
     DirEntry, FileSystem, FileSystemExt, FileType, FsBackend, FsLimitExceeded, FsLimits, FsUsage,
@@ -433,6 +435,8 @@ pub use limits::{
     ExecutionCounters, ExecutionLimits, LimitExceeded, MemoryBudget, MemoryLimits, SessionLimits,
 };
 pub use network::NetworkAllowlist;
+#[cfg(feature = "http_client")]
+pub use network::{NetworkPermissionCallback, NetworkRequest};
 pub use tool::BashToolBuilder as ToolBuilder;
 pub use tool::{
     BashTool, BashToolBuilder, Tool, ToolError, ToolExecution, ToolImage, ToolOutput,
@@ -658,17 +662,36 @@ impl Bash {
         // Load persisted history on first exec (no-op if already loaded)
         self.interpreter.load_history().await;
 
+        // Create a pausable execution clock. The interpreter checks this at
+        // command boundaries. External callbacks (network permission, FS
+        // permission) can pause it so user wait time doesn't count against
+        // the execution timeout.
+        let clock = clock::ExecutionClock::new();
+        self.interpreter.set_execution_clock(clock.clone());
+
         let exec_start = std::time::Instant::now();
-        // THREAT[TM-DOS-057]: Wrap execution with timeout to prevent sleep/blocking bypass
+        // THREAT[TM-DOS-057]: Outer timeout as safety net for builtins that
+        // block without hitting a command tick (e.g., `sleep 100`).
+        // We poll the ExecutionClock every second so that time spent paused
+        // (during permission callbacks) doesn't count toward the timeout.
         let execution_timeout = self.interpreter.limits().timeout;
         #[cfg(not(target_family = "wasm"))]
-        let result =
-            match tokio::time::timeout(execution_timeout, self.interpreter.execute(&ast)).await {
-                Ok(r) => r,
-                Err(_elapsed) => Err(Error::ResourceLimit(LimitExceeded::Timeout(
-                    execution_timeout,
-                ))),
-            };
+        let result = {
+            let execute_fut = self.interpreter.execute(&ast);
+            tokio::pin!(execute_fut);
+            loop {
+                tokio::select! {
+                    r = &mut execute_fut => break r,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if clock.is_expired(execution_timeout) {
+                            break Err(Error::ResourceLimit(LimitExceeded::Timeout(
+                                execution_timeout,
+                            )));
+                        }
+                    }
+                }
+            }
+        };
         #[cfg(target_family = "wasm")]
         let result = self.interpreter.execute(&ast).await;
         let duration_ms = exec_start.elapsed().as_millis() as u64;
@@ -1000,6 +1023,9 @@ pub struct BashBuilder {
     /// Network allowlist for curl/wget builtins
     #[cfg(feature = "http_client")]
     network_allowlist: Option<NetworkAllowlist>,
+    /// Async callback for dynamic network permission decisions
+    #[cfg(feature = "http_client")]
+    network_permission_callback: Option<network::NetworkPermissionCallback>,
     /// Logging configuration
     #[cfg(feature = "logging")]
     log_config: Option<logging::LogConfig>,
@@ -1164,6 +1190,45 @@ impl BashBuilder {
     #[cfg(feature = "http_client")]
     pub fn network(mut self, allowlist: NetworkAllowlist) -> Self {
         self.network_allowlist = Some(allowlist);
+        self
+    }
+
+    /// Set an async callback for dynamic network permission decisions.
+    ///
+    /// The callback is invoked when a URL is **not** in the static allowlist.
+    /// It receives a [`NetworkRequest`](network::NetworkRequest) with the method,
+    /// URL, host, and port, and returns `true` to allow or `false` to deny.
+    ///
+    /// The execution clock is automatically paused while the callback runs,
+    /// so user think-time does not count against the script's execution timeout.
+    ///
+    /// If both an allowlist and callback are configured, the allowlist is checked
+    /// first (fast path) and the callback is only called for non-matching URLs.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use bashkit::{Bash, NetworkAllowlist, NetworkPermissionCallback};
+    /// use std::sync::Arc;
+    ///
+    /// let callback: NetworkPermissionCallback = Arc::new(|req| {
+    ///     Box::pin(async move {
+    ///         println!("Allow {} {}?", req.method, req.url);
+    ///         true // or false to deny
+    ///     })
+    /// });
+    ///
+    /// let bash = Bash::builder()
+    ///     .network(NetworkAllowlist::new()) // empty static allowlist
+    ///     .network_permission_callback(callback)
+    ///     .build();
+    /// ```
+    #[cfg(feature = "http_client")]
+    pub fn network_permission_callback(
+        mut self,
+        callback: network::NetworkPermissionCallback,
+    ) -> Self {
+        self.network_permission_callback = Some(callback);
         self
     }
 
@@ -1625,6 +1690,8 @@ impl BashBuilder {
             self.history_file,
             #[cfg(feature = "http_client")]
             self.network_allowlist,
+            #[cfg(feature = "http_client")]
+            self.network_permission_callback,
             #[cfg(feature = "logging")]
             self.log_config,
             #[cfg(feature = "git")]
@@ -1710,6 +1777,9 @@ impl BashBuilder {
         custom_builtins: HashMap<String, Box<dyn Builtin>>,
         history_file: Option<PathBuf>,
         #[cfg(feature = "http_client")] network_allowlist: Option<NetworkAllowlist>,
+        #[cfg(feature = "http_client")] network_permission_callback: Option<
+            network::NetworkPermissionCallback,
+        >,
         #[cfg(feature = "logging")] log_config: Option<logging::LogConfig>,
         #[cfg(feature = "git")] git_config: Option<GitConfig>,
     ) -> Bash {
@@ -1753,9 +1823,24 @@ impl BashBuilder {
 
         // Configure HTTP client for network builtins
         #[cfg(feature = "http_client")]
-        if let Some(allowlist) = network_allowlist {
-            let client = network::HttpClient::new(allowlist);
-            interpreter.set_http_client(client);
+        {
+            // If we have a permission callback but no allowlist, create an
+            // empty allowlist so the client gets created (all URLs go through
+            // the callback).
+            let effective_allowlist = network_allowlist.or_else(|| {
+                if network_permission_callback.is_some() {
+                    Some(NetworkAllowlist::new())
+                } else {
+                    None
+                }
+            });
+            if let Some(allowlist) = effective_allowlist {
+                let mut client = network::HttpClient::new(allowlist);
+                if let Some(callback) = network_permission_callback {
+                    client.set_permission_callback(callback);
+                }
+                interpreter.set_http_client(client);
+            }
         }
 
         // Configure git client for git builtins

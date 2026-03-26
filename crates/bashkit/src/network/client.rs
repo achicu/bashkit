@@ -16,10 +16,13 @@
 //! - **TM-NET-014**: DNS rebind via redirect → manual redirect requires allowlist check
 
 use reqwest::Client;
-use std::sync::OnceLock;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use super::allowlist::{NetworkAllowlist, UrlMatch};
+use crate::clock::ExecutionClock;
 use crate::error::{Error, Result};
 
 /// Default maximum response body size (10 MB)
@@ -34,17 +37,61 @@ pub const MAX_TIMEOUT_SECS: u64 = 600;
 /// Minimum allowed timeout (1 second) - prevents instant timeouts that waste resources
 pub const MIN_TIMEOUT_SECS: u64 = 1;
 
+/// Information about a network request, passed to permission callbacks.
+#[derive(Debug, Clone)]
+pub struct NetworkRequest {
+    /// HTTP method (GET, POST, etc.)
+    pub method: Method,
+    /// Full request URL
+    pub url: String,
+    /// Hostname extracted from the URL
+    pub host: String,
+    /// Port number (443 for https, 80 for http, or explicit)
+    pub port: u16,
+}
+
+/// Async callback for dynamic network permission decisions.
+///
+/// Called when a URL is **not** in the static allowlist. The callback receives
+/// a [`NetworkRequest`] with the method, URL, host, and port, and returns
+/// `true` to allow or `false` to deny the request.
+///
+/// The execution clock is automatically paused while the callback runs,
+/// so user think-time does not count against the script's execution timeout.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use bashkit::NetworkPermissionCallback;
+/// use std::sync::Arc;
+///
+/// let callback: NetworkPermissionCallback = Arc::new(|req| {
+///     Box::pin(async move {
+///         // Prompt user: "Allow POST to api.example.com?"
+///         prompt_user(&req).await
+///     })
+/// });
+/// ```
+pub type NetworkPermissionCallback =
+    Arc<dyn Fn(NetworkRequest) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
 /// HTTP client with allowlist-based access control.
 ///
 /// # Security Features
 ///
-/// - URL allowlist enforcement
+/// - URL allowlist enforcement (static patterns, checked first)
+/// - Optional async permission callback for dynamic approval
+/// - Execution clock pausing during permission waits
 /// - Response size limits to prevent memory exhaustion
 /// - Configurable timeouts to prevent hanging
 /// - No automatic redirect following (to prevent allowlist bypass)
 pub struct HttpClient {
     client: OnceLock<std::result::Result<Client, String>>,
     allowlist: NetworkAllowlist,
+    /// Async callback invoked when a URL is not in the static allowlist.
+    permission_callback: Option<NetworkPermissionCallback>,
+    /// Execution clock to pause during permission callbacks.
+    execution_clock: Option<ExecutionClock>,
     default_timeout: Duration,
     /// Maximum response body size in bytes
     max_response_bytes: usize,
@@ -59,6 +106,19 @@ pub enum Method {
     Delete,
     Head,
     Patch,
+}
+
+impl std::fmt::Display for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Method::Get => write!(f, "GET"),
+            Method::Post => write!(f, "POST"),
+            Method::Put => write!(f, "PUT"),
+            Method::Delete => write!(f, "DELETE"),
+            Method::Head => write!(f, "HEAD"),
+            Method::Patch => write!(f, "PATCH"),
+        }
+    }
 }
 
 impl Method {
@@ -132,9 +192,30 @@ impl HttpClient {
         Self {
             client: OnceLock::new(),
             allowlist,
+            permission_callback: None,
+            execution_clock: None,
             default_timeout: timeout,
             max_response_bytes,
         }
+    }
+
+    /// Set an async permission callback for dynamic network access decisions.
+    ///
+    /// The callback is invoked when a URL is not in the static allowlist.
+    /// If both an allowlist and callback are configured, the allowlist is
+    /// checked first (fast path) and the callback is only called for URLs
+    /// not in the allowlist.
+    pub fn set_permission_callback(&mut self, callback: NetworkPermissionCallback) {
+        self.permission_callback = Some(callback);
+    }
+
+    /// Set the execution clock for pausing during permission callbacks.
+    ///
+    /// When set, the clock is paused while waiting for the permission
+    /// callback so that user think-time doesn't count against the
+    /// script's execution timeout.
+    pub fn set_execution_clock(&mut self, clock: ExecutionClock) {
+        self.execution_clock = Some(clock);
     }
 
     fn client(&self) -> Result<&Client> {
@@ -176,11 +257,51 @@ impl HttpClient {
         self.request_with_headers(method, url, body, &[]).await
     }
 
+    /// Check whether a URL is allowed, consulting the permission callback
+    /// if the static allowlist denies it. Pauses the execution clock during
+    /// the callback so user wait time doesn't count against the timeout.
+    async fn check_access(&self, method: Method, url: &str) -> Result<()> {
+        match self.allowlist.check(url) {
+            UrlMatch::Allowed => Ok(()),
+            UrlMatch::Invalid { reason } => Err(Error::Network(format!("invalid URL: {}", reason))),
+            UrlMatch::Blocked { reason } => {
+                // If a permission callback is configured, ask it
+                let Some(ref callback) = self.permission_callback else {
+                    return Err(Error::Network(format!("access denied: {}", reason)));
+                };
+
+                let request = NetworkRequest {
+                    method,
+                    url: url.to_string(),
+                    host: url::Url::parse(url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(String::from))
+                        .unwrap_or_default(),
+                    port: url::Url::parse(url)
+                        .ok()
+                        .and_then(|u| u.port_or_known_default())
+                        .unwrap_or(0),
+                };
+
+                // Pause the execution clock while waiting for user decision
+                let _guard = self.execution_clock.as_ref().map(|c| c.pause());
+                let allowed = callback(request).await;
+
+                if allowed {
+                    Ok(())
+                } else {
+                    Err(Error::Network(format!("access denied: {}", reason)))
+                }
+            }
+        }
+    }
+
     /// Make an HTTP request with custom headers.
     ///
     /// # Security
     ///
     /// - URL is validated against the allowlist before making the request
+    /// - If a permission callback is set, it is consulted for URLs not in the allowlist
     /// - Response body is limited to `max_response_bytes` to prevent memory exhaustion
     /// - Redirects are not automatically followed (to prevent allowlist bypass)
     pub async fn request_with_headers(
@@ -190,16 +311,8 @@ impl HttpClient {
         body: Option<&[u8]>,
         headers: &[(String, String)],
     ) -> Result<Response> {
-        // Check allowlist BEFORE making any network request
-        match self.allowlist.check(url) {
-            UrlMatch::Allowed => {}
-            UrlMatch::Blocked { reason } => {
-                return Err(Error::Network(format!("access denied: {}", reason)));
-            }
-            UrlMatch::Invalid { reason } => {
-                return Err(Error::Network(format!("invalid URL: {}", reason)));
-            }
-        }
+        // Check allowlist (and optionally permission callback) BEFORE making any network request
+        self.check_access(method, url).await?;
 
         // Build request
         let mut request = self.client()?.request(method.as_reqwest(), url);
@@ -342,16 +455,8 @@ impl HttpClient {
         timeout_secs: Option<u64>,
         connect_timeout_secs: Option<u64>,
     ) -> Result<Response> {
-        // Check allowlist BEFORE making any network request
-        match self.allowlist.check(url) {
-            UrlMatch::Allowed => {}
-            UrlMatch::Blocked { reason } => {
-                return Err(Error::Network(format!("access denied: {}", reason)));
-            }
-            UrlMatch::Invalid { reason } => {
-                return Err(Error::Network(format!("invalid URL: {}", reason)));
-            }
-        }
+        // Check allowlist (and optionally permission callback) BEFORE making any network request
+        self.check_access(method, url).await?;
 
         // Use the custom timeout client if any timeout is specified, otherwise use default client
         let client = if timeout_secs.is_some() || connect_timeout_secs.is_some() {
