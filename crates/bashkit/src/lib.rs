@@ -436,7 +436,7 @@ pub use limits::{
 };
 pub use network::NetworkAllowlist;
 #[cfg(feature = "http_client")]
-pub use network::{NetworkPermissionCallback, NetworkRequest};
+pub use network::{Method, NetworkPermissionCallback, NetworkRequest};
 pub use tool::BashToolBuilder as ToolBuilder;
 pub use tool::{
     BashTool, BashToolBuilder, Tool, ToolError, ToolExecution, ToolImage, ToolOutput,
