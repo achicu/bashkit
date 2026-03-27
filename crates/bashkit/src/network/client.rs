@@ -267,20 +267,27 @@ impl HttpClient {
             UrlMatch::Blocked { reason } => {
                 // If a permission callback is configured, ask it
                 let Some(ref callback) = self.permission_callback else {
-                    return Err(Error::Network(format!("access denied: {}", reason)));
+                    return Err(Error::Network(format!(
+                        "access denied: {} {} ({})",
+                        method, url, reason
+                    )));
                 };
+
+                let parsed = url::Url::parse(url).ok();
+                let host = parsed
+                    .as_ref()
+                    .and_then(|u| u.host_str().map(String::from))
+                    .unwrap_or_default();
+                let port = parsed
+                    .as_ref()
+                    .and_then(|u| u.port_or_known_default())
+                    .unwrap_or(0);
 
                 let request = NetworkRequest {
                     method,
                     url: url.to_string(),
-                    host: url::Url::parse(url)
-                        .ok()
-                        .and_then(|u| u.host_str().map(String::from))
-                        .unwrap_or_default(),
-                    port: url::Url::parse(url)
-                        .ok()
-                        .and_then(|u| u.port_or_known_default())
-                        .unwrap_or(0),
+                    host: host.clone(),
+                    port,
                 };
 
                 // Pause the execution clock while waiting for user decision
@@ -290,7 +297,10 @@ impl HttpClient {
                 if allowed {
                     Ok(())
                 } else {
-                    Err(Error::Network(format!("access denied: {}", reason)))
+                    Err(Error::Network(format!(
+                        "access denied: {} {} ({})",
+                        method, host, reason
+                    )))
                 }
             }
         }
